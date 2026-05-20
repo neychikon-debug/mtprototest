@@ -1,98 +1,173 @@
 #!/bin/bash
 
-# --- Проверка прав суперпользователя ---
+# ══════════════════════════════════════════
+# Проверка прав
+# ══════════════════════════════════════════
 if [[ $EUID -ne 0 ]]; then
-   echo "Этот скрипт нужно запускать с правами root (sudo)." 
+   echo "Запустите скрипт с правами root (sudo)."
    exit 1
 fi
 
-# --- Настройки (можно менять) ---
-CONTAINER_NAME="mtproto-proxy"
-FAKE_TLS_DOMAIN="ya.ru" # Домен для маскировки трафика (ya.ru, 1c.ru и т.д.)
-HOST_PORT="443"         # Желаемый порт
-ALT_PORT="8443"         # Альтернативный порт, если основной занят
+# ══════════════════════════════════════════
+# Настройки (можно менять)
+# ══════════════════════════════════════════
+FAKE_TLS_DOMAIN="ya.ru"          # Домен для маскировки фейк‑TLS
+TLS_PORT="443"                   # Порт для фейк‑TLS
+PLAIN_PORT="8443"                # Порт для обычного прокси
+ALT_TLS_PORT="8444"              # Запасные порты, если основные заняты
+ALT_PLAIN_PORT="9443"
 
-# --- Вспомогательные функции ---
-# Функция для цветного вывода
+# ══════════════════════════════════════════
+# Цветной вывод
+# ══════════════════════════════════════════
 print_color() {
-    local color=$1
-    local message=$2
-    case $color in
-        "green") echo -e "\033[0;32m${message}\033[0m" ;;
-        "red") echo -e "\033[0;31m${message}\033[0m" ;;
-        "yellow") echo -e "\033[1;33m${message}\033[0m" ;;
-        "blue") echo -e "\033[0;34m${message}\033[0m" ;;
-        *) echo "${message}" ;;
+    case $1 in
+        green)  echo -e "\033[0;32m$2\033[0m" ;;
+        red)    echo -e "\033[0;31m$2\033[0m" ;;
+        yellow) echo -e "\033[1;33m$2\033[0m" ;;
+        blue)   echo -e "\033[0;34m$2\033[0m" ;;
+        *)      echo "$2" ;;
     esac
 }
 
-# --- Шаг 1: Установка Docker ---
-if ! command -v docker &> /dev/null; then
-    print_color "yellow" "🐳 Docker не найден. Устанавливаем..."
+# ══════════════════════════════════════════
+# 1. Установка Docker
+# ══════════════════════════════════════════
+if ! command -v docker &>/dev/null; then
+    print_color yellow "🐳 Docker не найден. Устанавливаем..."
     curl -fsSL https://get.docker.com -o get-docker.sh
     sh get-docker.sh
     rm get-docker.sh
     systemctl enable --now docker
-    print_color "green" "✅ Docker установлен."
+    print_color green "✅ Docker установлен."
 else
-    print_color "green" "🐳 Docker уже установлен."
+    print_color green "🐳 Docker уже присутствует."
 fi
 
-# --- Шаг 2: Получение внешнего IP-адреса ---
-print_color "yellow" "🌐 Определяем внешний IP-адрес..."
+# ══════════════════════════════════════════
+# 2. Внешний IP
+# ══════════════════════════════════════════
+print_color yellow "🌐 Определяем внешний IP..."
 SERVER_IP=$(curl -s ifconfig.me)
 if [[ -z "$SERVER_IP" ]]; then
-    print_color "red" "❌ Не удалось определить IP-адрес. Проверьте интернет-соединение."
+    print_color red "❌ Не удалось определить IP. Проверьте интернет."
     exit 1
 fi
-print_color "blue" "   Ваш IP: ${SERVER_IP}"
+print_color blue "   IP: $SERVER_IP"
 
-# --- Шаг 3: Выбор порта ---
-print_color "yellow" "🔌 Проверяем доступность порта ${HOST_PORT}..."
-if ss -tuln | grep -q ":${HOST_PORT} "; then
-    print_color "yellow" "⚠️ Порт ${HOST_PORT} занят. Будет использован порт ${ALT_PORT}."
-    PORT_TO_USE=$ALT_PORT
+# ══════════════════════════════════════════
+# 3. Проверка и выбор портов
+# ══════════════════════════════════════════
+check_port() {
+    # $1 = порт, $2 = описание
+    if ss -tuln | grep -q ":${1} "; then
+        return 1  # занят
+    else
+        return 0  # свободен
+    fi
+}
+
+# Проверяем TLS порт
+print_color yellow "🔌 Проверяем порт для фейк‑TLS ($TLS_PORT)..."
+if check_port $TLS_PORT; then
+    FINAL_TLS_PORT=$TLS_PORT
+    print_color green "   ✅ Порт $TLS_PORT свободен."
 else
-    print_color "green" "✅ Порт ${HOST_PORT} свободен."
-    PORT_TO_USE=$HOST_PORT
+    print_color yellow "   ⚠️  Порт $TLS_PORT занят. Используем $ALT_TLS_PORT."
+    FINAL_TLS_PORT=$ALT_TLS_PORT
+    if ! check_port $FINAL_TLS_PORT; then
+        print_color red "❌ И запасной порт $ALT_TLS_PORT занят. Освободите один из портов."
+        exit 1
+    fi
 fi
 
-# --- Шаг 4: Генерация секрета ---
+# Проверяем обычный порт
+print_color yellow "🔌 Проверяем порт для обычного прокси ($PLAIN_PORT)..."
+if check_port $PLAIN_PORT; then
+    FINAL_PLAIN_PORT=$PLAIN_PORT
+    print_color green "   ✅ Порт $PLAIN_PORT свободен."
+else
+    print_color yellow "   ⚠️  Порт $PLAIN_PORT занят. Используем $ALT_PLAIN_PORT."
+    FINAL_PLAIN_PORT=$ALT_PLAIN_PORT
+    if ! check_port $FINAL_PLAIN_PORT; then
+        print_color red "❌ И запасной порт $ALT_PLAIN_PORT занят. Освободите порт."
+        exit 1
+    fi
+fi
+
+# ══════════════════════════════════════════
+# 4. Генерация секрета (один для обоих)
+# ══════════════════════════════════════════
 SECRET=$(head -c 16 /dev/urandom | xxd -ps)
-print_color "blue" "🔑 Секрет для подключения: ${SECRET}"
+print_color blue "🔑 Секрет: $SECRET"
 
-# --- Шаг 5: Настройка и запуск контейнера ---
-print_color "yellow" "🛠️ Запускаем Docker-контейнер..."
-docker pull arm64builds/mtproxy:latest
+# ══════════════════════════════════════════
+# 5. Запуск контейнеров
+# ══════════════════════════════════════════
+print_color yellow "🛠️  Загружаем официальный образ Telegram..."
+docker pull telegrammessenger/proxy:latest
+
+# Контейнер с фейк‑TLS
+print_color yellow "🔒 Запускаем фейк‑TLS прокси (порт $FINAL_TLS_PORT)..."
 docker run -d \
-    --name ${CONTAINER_NAME} \
+    --name mtproto-tls \
     --restart always \
-    -p ${PORT_TO_USE}:8888 \
+    -p ${FINAL_TLS_PORT}:443 \
     -e SECRET=${SECRET} \
-    -e FAKE_TLS_DOMAIN=${FAKE_TLS_DOMAIN} \
-    arm64builds/mtproxy:latest
+    -e TLS_DOMAIN=${FAKE_TLS_DOMAIN} \
+    telegrammessenger/proxy:latest
 
-if [ $? -eq 0 ]; then
-    print_color "green" "✅ Прокси-сервер успешно запущен."
-else
-    print_color "red" "❌ Ошибка при запуске контейнера. Проверьте логи: docker logs ${CONTAINER_NAME}"
+if [ $? -ne 0 ]; then
+    print_color red "❌ Ошибка запуска фейк‑TLS контейнера."
     exit 1
 fi
 
-# --- Шаг 6: Формирование и вывод ссылки для подключения ---
-# Ссылка формата: tg://proxy?server=<IP>&port=<PORT>&secret=<SECRET>
-CONNECTION_URL="tg://proxy?server=${SERVER_IP}&port=${PORT_TO_USE}&secret=${SECRET}"
+# Контейнер без шифрования (обычный)
+print_color yellow "🔓 Запускаем обычный прокси (порт $FINAL_PLAIN_PORT)..."
+docker run -d \
+    --name mtproto-plain \
+    --restart always \
+    -p ${FINAL_PLAIN_PORT}:443 \
+    -e SECRET=${SECRET} \
+    telegrammessenger/proxy:latest
+
+if [ $? -ne 0 ]; then
+    print_color red "❌ Ошибка запуска обычного контейнера."
+    exit 1
+fi
+
+# ══════════════════════════════════════════
+# 6. Формирование информации для подключения
+# ══════════════════════════════════════════
+PLAIN_LINK="tg://proxy?server=${SERVER_IP}&port=${FINAL_PLAIN_PORT}&secret=${SECRET}"
+TLS_LINK="tg://proxy?server=${SERVER_IP}&port=${FINAL_TLS_PORT}&secret=${SECRET}"
 
 echo ""
-print_color "green" "🎉 Ваш MTProto прокси с FakeTLS готов к работе!"
-echo "----------------------------------------"
-print_color "blue" "🔗 Ссылка для подключения:"
-echo "   ${CONNECTION_URL}"
+print_color green "══════════════════════════════════════════════"
+print_color green "  Оба прокси успешно запущены!"
+print_color green "══════════════════════════════════════════════"
 echo ""
-print_color "yellow" "📋 Как подключиться:"
-echo "   1. Откройте Telegram."
-echo "   2. Перейдите в: Настройки -> Продвинутые настройки -> Тип соединения -> Использовать собственный прокси."
-echo "   3. Нажмите 'Добавить прокси' и вставьте скопированную ссылку."
+
+print_color blue "🔵 Обычный прокси (без шифрования):"
+echo "   Сервер: $SERVER_IP"
+echo "   Порт:   $FINAL_PLAIN_PORT"
+echo "   Секрет: $SECRET"
+echo "   Ссылка: $PLAIN_LINK"
 echo ""
-print_color "yellow" "📝 Для просмотра логов: docker logs ${CONTAINER_NAME}"
+
+print_color blue "🟢 Фейк‑TLS прокси (маскировка под $FAKE_TLS_DOMAIN):"
+echo "   Сервер: $SERVER_IP"
+echo "   Порт:   $FINAL_TLS_PORT"
+echo "   Секрет: $SECRET"
+echo "   Ссылка: $TLS_LINK"
+echo ""
+
+print_color yellow "📋 Как подключить в Telegram:"
+echo "   Настройки → Продвинутые настройки → Тип соединения →"
+echo "   Использовать собственный прокси → Добавить прокси"
+echo "   и вставить соответствующую ссылку из списка выше."
+echo ""
+print_color yellow "📝 Просмотр логов:"
+echo "   docker logs mtproto-tls"
+echo "   docker logs mtproto-plain"
 echo ""
