@@ -9,13 +9,37 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ══════════════════════════════════════════
-# Настройки (можно менять)
+# Конфигурационный файл
 # ══════════════════════════════════════════
-FAKE_TLS_DOMAIN="ya.ru"          # Домен для маскировки фейк‑TLS
-TLS_PORT="443"                   # Порт для фейк‑TLS
-PLAIN_PORT="8443"                # Порт для обычного прокси
-ALT_TLS_PORT="8444"              # Запасные порты, если основные заняты
-ALT_PLAIN_PORT="9443"
+CONFIG_FILE="/etc/mtproxy.conf"
+
+# Значения по умолчанию (будут записаны в конфиг при первом запуске)
+DEFAULT_TLS_DOMAIN="ya.ru"
+DEFAULT_TLS_PORT="443"
+DEFAULT_PLAIN_PORT="8443"
+DEFAULT_ALT_TLS_PORT="8444"
+DEFAULT_ALT_PLAIN_PORT="9443"
+DEFAULT_PROMO_CHANNEL=""        # оставьте пустым, если пока не нужен
+
+# Если конфиг существует — загружаем, иначе создаём с дефолтными значениями
+if [[ -f "$CONFIG_FILE" ]]; then
+    print_color blue "📄 Загружаем конфигурацию из $CONFIG_FILE"
+    source "$CONFIG_FILE"
+else
+    print_color yellow "⚙️  Конфиг не найден, создаём $CONFIG_FILE со значениями по умолчанию."
+    cat > "$CONFIG_FILE" <<EOF
+# Настройки MTProto прокси
+FAKE_TLS_DOMAIN="${DEFAULT_TLS_DOMAIN}"
+TLS_PORT="${DEFAULT_TLS_PORT}"
+PLAIN_PORT="${DEFAULT_PLAIN_PORT}"
+ALT_TLS_PORT="${DEFAULT_ALT_TLS_PORT}"
+ALT_PLAIN_PORT="${DEFAULT_ALT_PLAIN_PORT}"
+PROMO_CHANNEL="${DEFAULT_PROMO_CHANNEL}"
+# SECRET будет сгенерирован автоматически и записан сюда после первого запуска
+SECRET=""
+EOF
+    source "$CONFIG_FILE"
+fi
 
 # ══════════════════════════════════════════
 # Цветной вывод
@@ -59,7 +83,6 @@ print_color blue "   IP: $SERVER_IP"
 # 3. Проверка и выбор портов
 # ══════════════════════════════════════════
 check_port() {
-    # $1 = порт, $2 = описание
     if ss -tuln | grep -q ":${1} "; then
         return 1  # занят
     else
@@ -96,13 +119,43 @@ else
 fi
 
 # ══════════════════════════════════════════
-# 4. Генерация секрета (один для обоих)
+# 4. Генерация или загрузка секрета
 # ══════════════════════════════════════════
-SECRET=$(head -c 16 /dev/urandom | xxd -ps)
-print_color blue "🔑 Секрет: $SECRET"
+if [[ -z "$SECRET" ]]; then
+    print_color yellow "🔑 Генерируем новый секрет..."
+    SECRET=$(head -c 16 /dev/urandom | xxd -ps)
+    # Сохраняем секрет в конфиг
+    sed -i "s/^SECRET=.*/SECRET=\"${SECRET}\"/" "$CONFIG_FILE"
+    print_color green "   Секрет сохранён в $CONFIG_FILE"
+else
+    print_color blue "🔑 Используем существующий секрет из конфига."
+fi
+print_color blue "   Секрет: $SECRET"
 
 # ══════════════════════════════════════════
-# 5. Запуск контейнеров
+# 5. Проверка промоканала (если задан)
+# ══════════════════════════════════════════
+if [[ -z "$PROMO_CHANNEL" ]]; then
+    print_color red "⚠️  PROMO_CHANNEL не задан!"
+    print_color yellow "   Официальный прокси Telegram НЕ будет работать без идентификатора канала."
+    print_color yellow "   Создайте канал в Telegram, получите его ID (например, -1001234567890)"
+    print_color yellow "   и пропишите в $CONFIG_FILE: PROMO_CHANNEL=\"-1001234567890\""
+    print_color yellow "   После этого перезапустите скрипт."
+    echo ""
+    read -p "Продолжить установку без промоканала? (y/n): " -r
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# ══════════════════════════════════════════
+# 6. Остановка и удаление старых контейнеров (при перезапуске)
+# ══════════════════════════════════════════
+docker stop mtproto-tls mtproto-plain 2>/dev/null
+docker rm mtproto-tls mtproto-plain 2>/dev/null
+
+# ══════════════════════════════════════════
+# 7. Запуск контейнеров
 # ══════════════════════════════════════════
 print_color yellow "🛠️  Загружаем официальный образ Telegram..."
 docker pull telegrammessenger/proxy:latest
@@ -115,6 +168,7 @@ docker run -d \
     -p ${FINAL_TLS_PORT}:443 \
     -e SECRET=${SECRET} \
     -e TLS_DOMAIN=${FAKE_TLS_DOMAIN} \
+    -e PROMO_CHANNEL=${PROMO_CHANNEL} \
     telegrammessenger/proxy:latest
 
 if [ $? -ne 0 ]; then
@@ -129,6 +183,7 @@ docker run -d \
     --restart always \
     -p ${FINAL_PLAIN_PORT}:443 \
     -e SECRET=${SECRET} \
+    -e PROMO_CHANNEL=${PROMO_CHANNEL} \
     telegrammessenger/proxy:latest
 
 if [ $? -ne 0 ]; then
@@ -137,7 +192,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # ══════════════════════════════════════════
-# 6. Формирование информации для подключения
+# 8. Формирование информации для подключения
 # ══════════════════════════════════════════
 PLAIN_LINK="tg://proxy?server=${SERVER_IP}&port=${FINAL_PLAIN_PORT}&secret=${SECRET}"
 TLS_LINK="tg://proxy?server=${SERVER_IP}&port=${FINAL_TLS_PORT}&secret=${SECRET}"
@@ -171,3 +226,6 @@ print_color yellow "📝 Просмотр логов:"
 echo "   docker logs mtproto-tls"
 echo "   docker logs mtproto-plain"
 echo ""
+print_color yellow "⚙️  Конфигурация хранится в $CONFIG_FILE"
+echo "   Вы можете изменить домен маскировки, порты или добавить промоканал"
+echo "   и просто перезапустить скрипт."
