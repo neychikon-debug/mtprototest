@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# ========== Цвета для вывода ==========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -11,15 +10,15 @@ info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ========== Проверка Docker ==========
+# Проверка Docker
 if ! command -v docker &> /dev/null; then
-    error "Docker не установлен. Установите Docker: curl -fsSL https://get.docker.com | sh"
+    error "Docker не установлен. Установите: curl -fsSL https://get.docker.com | sh"
 fi
 if ! docker info &> /dev/null; then
     error "Docker не запущен. Запустите: systemctl start docker"
 fi
 
-# ========== Внешний IP ==========
+# Внешний IP
 get_public_ip() {
     for service in ifconfig.me icanhazip.com ipinfo.io/ip api.ipify.org; do
         ip=$(curl -s --max-time 5 "$service" 2>/dev/null | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
@@ -32,12 +31,12 @@ PUBLIC_IP=$(get_public_ip)
 [[ -z "$PUBLIC_IP" ]] && error "Не удалось определить внешний IP. Проверьте интернет."
 info "Ваш IP: $PUBLIC_IP"
 
-# ========== Порт ==========
+# Порт
 read -p "Введите порт для прокси (1024-65535, по умолчанию 1080): " PORT
 PORT=${PORT:-1080}
 [[ ! "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ] && error "Порт должен быть числом от 1024 до 65535."
 
-# ========== Аутентификация (исправлено) ==========
+# Аутентификация
 read -p "Использовать логин/пароль? (y/N): " USE_AUTH
 USE_AUTH=${USE_AUTH,,}
 AUTH_ENABLED=false
@@ -59,7 +58,7 @@ else
     warn "Прокси будет без аутентификации. Это небезопасно!"
 fi
 
-# ========== Запуск контейнера ==========
+# Запуск контейнера
 CONTAINER_NAME="socks5-proxy-${PORT}"
 docker stop "$CONTAINER_NAME" 2>/dev/null && docker rm "$CONTAINER_NAME" 2>/dev/null || true
 
@@ -87,7 +86,7 @@ fi
 
 info "✅ SOCKS5 прокси запущен!"
 
-# ========== Формирование данных подключения ==========
+# Данные подключения
 if $AUTH_ENABLED; then
     CONNECTION_STRING="socks5://${PROXY_USER}:${PROXY_PASS}@${PUBLIC_IP}:${PORT}"
     INFO_TEXT="IP: $PUBLIC_IP\nПорт: $PORT\nЛогин: $PROXY_USER\nПароль: $PROXY_PASS"
@@ -104,7 +103,6 @@ echo "Строка подключения: $CONNECTION_STRING"
 echo "==========================================="
 echo ""
 
-# Сохраняем в файл
 FILENAME="socks5_${PORT}_$(date +%Y%m%d_%H%M%S).txt"
 cat > "$FILENAME" <<EOF
 SOCKS5 Proxy Info
@@ -116,7 +114,7 @@ Connection string: $CONNECTION_STRING
 EOF
 info "Данные сохранены в $FILENAME"
 
-# ========== Telegram бот (управление) ==========
+# Telegram бот
 read -p "📱 Настроить управление через Telegram-бота? (y/N): " SETUP_BOT
 SETUP_BOT=${SETUP_BOT,,}
 if [[ "$SETUP_BOT" != "y" && "$SETUP_BOT" != "yes" ]]; then
@@ -124,34 +122,43 @@ if [[ "$SETUP_BOT" != "y" && "$SETUP_BOT" != "yes" ]]; then
     exit 0
 fi
 
-# Проверяем Python
+# Установка Python и venv, если нет
 if ! command -v python3 &> /dev/null; then
     warn "Python3 не найден. Устанавливаем..."
-    apt update && apt install -y python3 python3-pip
+    apt update && apt install -y python3 python3-venv python3-pip
 fi
 
-# Устанавливаем библиотеку для бота
-pip3 install pyTelegramBotAPI --quiet
+if ! dpkg -l | grep -q python3-venv; then
+    apt install -y python3-venv
+fi
 
-# Запрашиваем токен бота
+# Создаём виртуальное окружение
+VENV_DIR="/opt/socks5_bot_venv"
+if [ ! -d "$VENV_DIR" ]; then
+    python3 -m venv "$VENV_DIR"
+    info "Виртуальное окружение создано в $VENV_DIR"
+fi
+
+# Устанавливаем pyTelegramBotAPI внутри venv
+"$VENV_DIR/bin/pip" install pyTelegramBotAPI --quiet
+
+# Запрос токена и chat ID
 read -p "Введите токен бота (от @BotFather): " BOT_TOKEN
 [[ -z "$BOT_TOKEN" ]] && error "Токен обязателен"
 
-# Запрашиваем admin chat_id (тот, кто сможет управлять)
 read -p "Введите ваш Telegram Chat ID (получить у @userinfobot): " ADMIN_CHAT_ID
 [[ -z "$ADMIN_CHAT_ID" ]] && error "Chat ID обязателен"
 
-# Создаём Python бота с админ-листом и функциями управления прокси
+# Создаём скрипт бота (использует python из venv)
 BOT_SCRIPT="/opt/socks5_bot.py"
 sudo tee "$BOT_SCRIPT" > /dev/null <<EOF
-#!/usr/bin/env python3
+#!/opt/socks5_bot_venv/bin/python3
 import telebot
 import subprocess
-import os
 import time
 
 BOT_TOKEN = "$BOT_TOKEN"
-ADMIN_IDS = [$ADMIN_CHAT_ID]  # можно добавлять других через команду
+ADMIN_IDS = [$ADMIN_CHAT_ID]
 CONTAINER_NAME = "$CONTAINER_NAME"
 PORT = "$PORT"
 PUBLIC_IP = "$PUBLIC_IP"
@@ -190,58 +197,51 @@ def start_cmd(message):
 
 @bot.message_handler(commands=['status'])
 def status_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['restart'])
 def restart_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     subprocess.run(["docker", "restart", CONTAINER_NAME])
     time.sleep(2)
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['stop'])
 def stop_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     subprocess.run(["docker", "stop", CONTAINER_NAME])
     bot.reply_to(message, "⏹️ Прокси остановлен")
 
-@bot.message_handler(commands=['start'])
-def start_container(message):
-    if not is_admin(message.chat.id):
-        return
+@bot.message_handler(commands=['start_container'])
+def start_container_cmd(message):
+    if not is_admin(message.chat.id): return
     subprocess.run(["docker", "start", CONTAINER_NAME])
     time.sleep(2)
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['setpass'])
 def setpass_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     args = message.text.split()
     if len(args) != 3:
         bot.reply_to(message, "Использование: /setpass логин пароль")
         return
     new_user, new_pass = args[1], args[2]
-    # Обновляем контейнер
     subprocess.run(["docker", "stop", CONTAINER_NAME])
     subprocess.run(["docker", "rm", CONTAINER_NAME])
     cmd = ["docker", "run", "-d", "--name", CONTAINER_NAME, "--restart", "unless-stopped", "-p", f"{PORT}:1080", "-e", f"PROXY_USER={new_user}", "-e", f"PROXY_PASSWORD={new_pass}", "serjs/go-socks5-proxy"]
     subprocess.run(cmd)
     time.sleep(2)
     bot.reply_to(message, f"✅ Пароль изменён на {new_user}:{new_pass}\nПерезапуск...")
-    # Обновляем глобальные переменные (просто для информации)
+    # Обновляем глобальные переменные для статуса
     global PROXY_USER, PROXY_PASS
     PROXY_USER = new_user
     PROXY_PASS = new_pass
 
 @bot.message_handler(commands=['addadmin'])
 def addadmin_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     args = message.text.split()
     if len(args) != 2:
         bot.reply_to(message, "Использование: /addadmin chat_id")
@@ -255,8 +255,7 @@ def addadmin_cmd(message):
 
 @bot.message_handler(commands=['removeadmin'])
 def removeadmin_cmd(message):
-    if not is_admin(message.chat.id):
-        return
+    if not is_admin(message.chat.id): return
     args = message.text.split()
     if len(args) != 2:
         bot.reply_to(message, "Использование: /removeadmin chat_id")
@@ -274,7 +273,7 @@ EOF
 
 sudo chmod +x "$BOT_SCRIPT"
 
-# Создаём systemd сервис для автозапуска бота
+# Systemd сервис
 SERVICE_FILE="/etc/systemd/system/socks5-bot.service"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
@@ -283,7 +282,7 @@ After=network.target docker.service
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/bin/python3 $BOT_SCRIPT
+ExecStart=$VENV_DIR/bin/python3 $BOT_SCRIPT
 Restart=always
 User=root
 
@@ -296,7 +295,7 @@ sudo systemctl enable socks5-bot.service
 sudo systemctl start socks5-bot.service
 
 info "✅ Telegram-бот установлен и запущен. Администратор: $ADMIN_CHAT_ID"
-info "Бот отвечает на команды: /status, /restart, /stop, /setpass, /addadmin, /removeadmin"
+info "Бот отвечает на команды: /status, /restart, /stop, /start_container, /setpass, /addadmin, /removeadmin"
 info "Прокси и бот будут автоматически перезапускаться при перезагрузке сервера."
 
 echo ""
