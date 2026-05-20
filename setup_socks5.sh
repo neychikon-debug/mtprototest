@@ -122,7 +122,7 @@ if [[ "$SETUP_BOT" != "y" && "$SETUP_BOT" != "yes" ]]; then
     exit 0
 fi
 
-# Установка Python и venv, если нет
+# Установка Python и venv
 if ! command -v python3 &> /dev/null; then
     warn "Python3 не найден. Устанавливаем..."
     apt update && apt install -y python3 python3-venv python3-pip
@@ -132,14 +132,12 @@ if ! dpkg -l | grep -q python3-venv; then
     apt install -y python3-venv
 fi
 
-# Создаём виртуальное окружение
 VENV_DIR="/opt/socks5_bot_venv"
 if [ ! -d "$VENV_DIR" ]; then
     python3 -m venv "$VENV_DIR"
     info "Виртуальное окружение создано в $VENV_DIR"
 fi
 
-# Устанавливаем pyTelegramBotAPI внутри venv
 "$VENV_DIR/bin/pip" install pyTelegramBotAPI --quiet
 
 # Запрос токена и chat ID
@@ -149,13 +147,29 @@ read -p "Введите токен бота (от @BotFather): " BOT_TOKEN
 read -p "Введите ваш Telegram Chat ID (получить у @userinfobot): " ADMIN_CHAT_ID
 [[ -z "$ADMIN_CHAT_ID" ]] && error "Chat ID обязателен"
 
-# Создаём скрипт бота (использует python из venv)
+# Создаём скрипт бота с кнопками и логированием
 BOT_SCRIPT="/opt/socks5_bot.py"
+LOG_FILE="/var/log/socks5_bot.log"
+
 sudo tee "$BOT_SCRIPT" > /dev/null <<EOF
 #!/opt/socks5_bot_venv/bin/python3
 import telebot
 import subprocess
 import time
+import logging
+import sys
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("$LOG_FILE"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "$BOT_TOKEN"
 ADMIN_IDS = [$ADMIN_CHAT_ID]
@@ -171,6 +185,17 @@ bot = telebot.TeleBot(BOT_TOKEN)
 def is_admin(chat_id):
     return chat_id in ADMIN_IDS
 
+def get_main_keyboard():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    btn_status = KeyboardButton("/status")
+    btn_restart = KeyboardButton("/restart")
+    btn_stop = KeyboardButton("/stop")
+    btn_start = KeyboardButton("/start_container")
+    btn_setpass = KeyboardButton("/setpass")
+    btn_help = KeyboardButton("/help")
+    markup.add(btn_status, btn_restart, btn_stop, btn_start, btn_setpass, btn_help)
+    return markup
+
 def send_status(chat_id):
     cmd = ["docker", "ps", "--filter", f"name={CONTAINER_NAME}", "--format", "{{.Status}}"]
     try:
@@ -184,96 +209,145 @@ def send_status(chat_id):
                 text += "⚠️ Без пароля"
         else:
             text = f"❌ Прокси остановлен\nСтатус: {status}"
-    except:
+    except Exception as e:
+        logger.error(f"Ошибка получения статуса: {e}")
         text = "❌ Контейнер не найден"
-    bot.send_message(chat_id, text)
+    bot.send_message(chat_id, text, reply_markup=get_main_keyboard())
 
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 def start_cmd(message):
     if not is_admin(message.chat.id):
         bot.reply_to(message, "⛔ Доступ запрещён")
         return
-    bot.reply_to(message, "🔐 SOCKS5 Manager\n/status — статус\n/restart — перезапустить\n/stop — остановить\n/start — запустить\n/setpass логин пароль — сменить пароль\n/addadmin id — добавить админа\n/removeadmin id — удалить админа")
+    help_text = (
+        "🔐 *SOCKS5 Manager*\n\n"
+        "Команды:\n"
+        "/status — статус прокси\n"
+        "/restart — перезапустить прокси\n"
+        "/stop — остановить прокси\n"
+        "/start_container — запустить прокси\n"
+        "/setpass логин пароль — сменить логин и пароль\n"
+        "/addadmin id — добавить админа\n"
+        "/removeadmin id — удалить админа"
+    )
+    bot.send_message(message.chat.id, help_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
 @bot.message_handler(commands=['status'])
 def status_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['restart'])
 def restart_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
+    bot.send_message(message.chat.id, "🔄 Перезапуск прокси...")
     subprocess.run(["docker", "restart", CONTAINER_NAME])
     time.sleep(2)
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['stop'])
 def stop_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     subprocess.run(["docker", "stop", CONTAINER_NAME])
-    bot.reply_to(message, "⏹️ Прокси остановлен")
+    bot.reply_to(message, "⏹️ Прокси остановлен", reply_markup=get_main_keyboard())
 
 @bot.message_handler(commands=['start_container'])
 def start_container_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     subprocess.run(["docker", "start", CONTAINER_NAME])
     time.sleep(2)
     send_status(message.chat.id)
 
 @bot.message_handler(commands=['setpass'])
 def setpass_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     args = message.text.split()
     if len(args) != 3:
-        bot.reply_to(message, "Использование: /setpass логин пароль")
+        bot.reply_to(message, "Использование: /setpass логин пароль", reply_markup=get_main_keyboard())
         return
     new_user, new_pass = args[1], args[2]
+    bot.send_message(message.chat.id, "🔄 Изменяю пароль... Прокси будет перезапущен.")
     subprocess.run(["docker", "stop", CONTAINER_NAME])
     subprocess.run(["docker", "rm", CONTAINER_NAME])
-    cmd = ["docker", "run", "-d", "--name", CONTAINER_NAME, "--restart", "unless-stopped", "-p", f"{PORT}:1080", "-e", f"PROXY_USER={new_user}", "-e", f"PROXY_PASSWORD={new_pass}", "serjs/go-socks5-proxy"]
+    cmd = [
+        "docker", "run", "-d", "--name", CONTAINER_NAME,
+        "--restart", "unless-stopped", "-p", f"{PORT}:1080",
+        "-e", f"PROXY_USER={new_user}", "-e", f"PROXY_PASSWORD={new_pass}",
+        "serjs/go-socks5-proxy"
+    ]
     subprocess.run(cmd)
     time.sleep(2)
-    bot.reply_to(message, f"✅ Пароль изменён на {new_user}:{new_pass}\nПерезапуск...")
-    # Обновляем глобальные переменные для статуса
+    bot.reply_to(message, f"✅ Пароль изменён на {new_user}:{new_pass}\nПрокси перезапущен.", reply_markup=get_main_keyboard())
+    # Обновляем глобальные переменные (для вывода статуса)
     global PROXY_USER, PROXY_PASS
     PROXY_USER = new_user
     PROXY_PASS = new_pass
 
 @bot.message_handler(commands=['addadmin'])
 def addadmin_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     args = message.text.split()
     if len(args) != 2:
         bot.reply_to(message, "Использование: /addadmin chat_id")
         return
-    new_id = int(args[1])
-    if new_id not in ADMIN_IDS:
-        ADMIN_IDS.append(new_id)
-        bot.reply_to(message, f"✅ Админ {new_id} добавлен")
-    else:
-        bot.reply_to(message, "Уже в списке")
+    try:
+        new_id = int(args[1])
+        if new_id not in ADMIN_IDS:
+            ADMIN_IDS.append(new_id)
+            bot.reply_to(message, f"✅ Админ {new_id} добавлен", reply_markup=get_main_keyboard())
+        else:
+            bot.reply_to(message, "Уже в списке", reply_markup=get_main_keyboard())
+    except ValueError:
+        bot.reply_to(message, "Неверный формат ID")
 
 @bot.message_handler(commands=['removeadmin'])
 def removeadmin_cmd(message):
-    if not is_admin(message.chat.id): return
+    if not is_admin(message.chat.id):
+        return
     args = message.text.split()
     if len(args) != 2:
         bot.reply_to(message, "Использование: /removeadmin chat_id")
         return
-    remove_id = int(args[1])
-    if remove_id in ADMIN_IDS and remove_id != ADMIN_IDS[0]:
-        ADMIN_IDS.remove(remove_id)
-        bot.reply_to(message, f"❌ Админ {remove_id} удалён")
-    else:
-        bot.reply_to(message, "Нельзя удалить главного админа или такого нет")
+    try:
+        remove_id = int(args[1])
+        if remove_id in ADMIN_IDS and remove_id != ADMIN_IDS[0]:
+            ADMIN_IDS.remove(remove_id)
+            bot.reply_to(message, f"❌ Админ {remove_id} удалён", reply_markup=get_main_keyboard())
+        else:
+            bot.reply_to(message, "Нельзя удалить главного админа или такого нет")
+    except ValueError:
+        bot.reply_to(message, "Неверный формат ID")
 
-print("Бот запущен и слушает команды...")
-bot.polling(none_stop=True)
+# Обработка текстовых сообщений (если нажали кнопку без команды)
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    if not is_admin(message.chat.id):
+        return
+    # Если пользователь ввел что-то текстом, пробуем преобразовать в команду
+    text = message.text.strip()
+    if text.startswith('/'):
+        # уже команда, но обработчик сработает отдельно
+        return
+    else:
+        bot.reply_to(message, "Используйте кнопки меню или команды.", reply_markup=get_main_keyboard())
+
+logger.info("Бот запущен и слушает команды...")
+try:
+    bot.polling(none_stop=True, interval=1, timeout=30)
+except Exception as e:
+    logger.error(f"Ошибка polling: {e}")
+    sys.exit(1)
 EOF
 
 sudo chmod +x "$BOT_SCRIPT"
 
-# Systemd сервис
+# Создаём или обновляем systemd сервис
 SERVICE_FILE="/etc/systemd/system/socks5-bot.service"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
@@ -285,6 +359,7 @@ Requires=docker.service
 ExecStart=$VENV_DIR/bin/python3 $BOT_SCRIPT
 Restart=always
 User=root
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -292,11 +367,19 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable socks5-bot.service
-sudo systemctl start socks5-bot.service
+sudo systemctl restart socks5-bot.service
+sleep 3
 
-info "✅ Telegram-бот установлен и запущен. Администратор: $ADMIN_CHAT_ID"
-info "Бот отвечает на команды: /status, /restart, /stop, /start_container, /setpass, /addadmin, /removeadmin"
-info "Прокси и бот будут автоматически перезапускаться при перезагрузке сервера."
+# Проверяем статус
+if systemctl is-active --quiet socks5-bot.service; then
+    info "✅ Telegram-бот успешно запущен и работает."
+else
+    error "❌ Бот не запустился. Смотрите логи: journalctl -u socks5-bot.service -n 30"
+fi
+
+info "Логи бота: $LOG_FILE"
+info "Проверить статус: systemctl status socks5-bot.service"
+info "Посмотреть логи: journalctl -u socks5-bot.service -f"
 
 echo ""
 info "Всё готово! Данные прокси сохранены в $FILENAME"
