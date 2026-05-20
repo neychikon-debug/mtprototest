@@ -147,12 +147,6 @@ read -p "Введите токен бота (от @BotFather): " BOT_TOKEN
 read -p "Введите ваш Telegram Chat ID (получить у @userinfobot): " ADMIN_CHAT_ID
 [[ -z "$ADMIN_CHAT_ID" ]] && error "Chat ID обязателен"
 
-# Преобразуем AUTH_ENABLED в Python-булево значение (True/False)
-PY_AUTH_ENABLED="False"
-if [[ "$AUTH_ENABLED" == true ]]; then
-    PY_AUTH_ENABLED="True"
-fi
-
 # Создаём скрипт бота с кнопками
 BOT_SCRIPT="/opt/socks5_bot.py"
 LOG_FILE="/var/log/socks5_bot.log"
@@ -181,7 +175,8 @@ ADMIN_IDS = [$ADMIN_CHAT_ID]
 CONTAINER_NAME = "$CONTAINER_NAME"
 PORT = "$PORT"
 PUBLIC_IP = "$PUBLIC_IP"
-AUTH_ENABLED = $PY_AUTH_ENABLED
+# FIX: превращаем bash true/false в Python True/False
+AUTH_ENABLED = $([ "$AUTH_ENABLED" == true ] && echo "True" || echo "False")
 PROXY_USER = "$PROXY_USER"
 PROXY_PASS = "$PROXY_PASS"
 
